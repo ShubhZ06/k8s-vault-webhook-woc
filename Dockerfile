@@ -1,4 +1,4 @@
-FROM golang:1.16 AS builder
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /go/src/k8s-vault-webhook/
 

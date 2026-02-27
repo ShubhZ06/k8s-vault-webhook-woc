@@ -213,8 +213,8 @@ func (mw *mutatingWebhook) lookForEnvFrom(envFrom []corev1.EnvFromSource, ns str
 
 func (mw *mutatingWebhook) mutateContainers(containers []corev1.Container, podSpec *corev1.PodSpec, secretManagerConfig secretManagerConfig, ns string) (bool, error) {
 	mutated := false
-	var mutationInProgress bool
 	for i, container := range containers {
+		var mutationInProgress bool
 		var envVars []corev1.EnvVar
 		if len(container.EnvFrom) > 0 {
 			envFrom, err := mw.lookForEnvFrom(container.EnvFrom, ns) //nolint

@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -138,7 +138,7 @@ func getImageBlob(container ContainerInfo) (*imagev1.ImageConfig, error) {
 
 	defer reader.Close()
 
-	b, err := ioutil.ReadAll(reader)
+	b, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read blob: %s", err.Error())
 	}
