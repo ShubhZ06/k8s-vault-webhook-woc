@@ -7,14 +7,14 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"net/http"
-	"sort"
-	"strconv"
 	"strings"
+
+	"k8s-vault-webhook/provider"
+	"k8s-vault-webhook/registry"
+	"k8s-vault-webhook/version"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"k8s-vault-webhook/registry"
-	"k8s-vault-webhook/version"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
@@ -27,16 +27,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
-	// "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	// kubeVer "k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/kubernetes"
 	kubernetesConfig "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
-func (mw *mutatingWebhook) getVolumes(existingVolumes []corev1.Volume, secretManagerConfig secretManagerConfig) []corev1.Volume {
+func (mw *mutatingWebhook) getVolumes(existingVolumes []corev1.Volume, providers []provider.SecretManager) []corev1.Volume {
 	mw.logger.Debugf("Adding generic volumes to podspec")
 
 	volumes := []corev1.Volume{
@@ -50,37 +48,19 @@ func (mw *mutatingWebhook) getVolumes(existingVolumes []corev1.Volume, secretMan
 		},
 	}
 
-	if secretManagerConfig.gcp.config.serviceAccountKeySecretName != "" {
-		mw.logger.Debugf("Adding Google Cloud Key Volume to podspec")
-		volumes = append(volumes, []corev1.Volume{
-			{
-				Name: "google-cloud-key",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName: secretManagerConfig.gcp.config.serviceAccountKeySecretName,
-					},
-				},
-			},
-		}...)
+	// Collect extra volumes from all enabled providers
+	for _, p := range providers {
+		extraVols := p.ExtraVolumes()
+		if len(extraVols) > 0 {
+			mw.logger.Debugf("Adding extra volumes from provider %s", p.Name())
+			volumes = append(volumes, extraVols...)
+		}
 	}
 
-	if secretManagerConfig.vault.config.tlsSecretName != "" {
-		mw.logger.Debugf("Adding Vault TLS Volume to podspec")
-		volumes = append(volumes, []corev1.Volume{
-			{
-				Name: "vault-tls",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName: secretManagerConfig.vault.config.tlsSecretName,
-					},
-				},
-			},
-		}...)
-	}
 	return volumes
 }
 
-func getInitContainers(originalContainers []corev1.Container, secretManagerConfig secretManagerConfig, initContainersMutated bool, containersMutated bool) []corev1.Container {
+func getInitContainers(originalContainers []corev1.Container, initContainersMutated bool, containersMutated bool) []corev1.Container {
 	var containers = []corev1.Container{}
 
 	if initContainersMutated || containersMutated {
@@ -211,7 +191,7 @@ func (mw *mutatingWebhook) lookForEnvFrom(envFrom []corev1.EnvFromSource, ns str
 	return envVars, nil
 }
 
-func (mw *mutatingWebhook) mutateContainers(containers []corev1.Container, podSpec *corev1.PodSpec, secretManagerConfig secretManagerConfig, ns string) (bool, error) {
+func (mw *mutatingWebhook) mutateContainers(containers []corev1.Container, podSpec *corev1.PodSpec, providers []provider.SecretManager, ns string) (bool, error) {
 	mutated := false
 	for i, container := range containers {
 		var mutationInProgress bool
@@ -262,23 +242,9 @@ func (mw *mutatingWebhook) mutateContainers(containers []corev1.Container, podSp
 		container.Command = []string{"/k8s-secret/k8s-secret-injector"}
 		container.Args = args
 
-		if secretManagerConfig.azure.config.enabled {
-			container = secretManagerConfig.azure.mutateContainer(container)
-			mutationInProgress = true
-		}
-
-		if secretManagerConfig.aws.config.enabled {
-			container = secretManagerConfig.aws.mutateContainer(container)
-			mutationInProgress = true
-		}
-
-		if secretManagerConfig.gcp.config.enabled {
-			container = secretManagerConfig.gcp.mutateContainer(container)
-			mutationInProgress = true
-		}
-
-		if secretManagerConfig.vault.config.enabled {
-			container = secretManagerConfig.vault.mutateContainer(container)
+		// Use the provider registry loop instead of hardcoded if-chains
+		for _, p := range providers {
+			container = p.MutateContainer(container)
 			mutationInProgress = true
 		}
 
@@ -300,10 +266,10 @@ func (mw *mutatingWebhook) mutateContainers(containers []corev1.Container, podSp
 	return mutated, nil
 }
 
-func (mw *mutatingWebhook) mutatePod(pod *corev1.Pod, secretManagerConfig secretManagerConfig, ns string, dryRun bool) error {
+func (mw *mutatingWebhook) mutatePod(pod *corev1.Pod, providers []provider.SecretManager, ns string, dryRun bool) error {
 	mw.logger.Debugf("Successfully connected to the API")
 
-	initContainersMutated, err := mw.mutateContainers(pod.Spec.InitContainers, &pod.Spec, secretManagerConfig, ns)
+	initContainersMutated, err := mw.mutateContainers(pod.Spec.InitContainers, &pod.Spec, providers, ns)
 	if err != nil {
 		return err
 	}
@@ -314,7 +280,7 @@ func (mw *mutatingWebhook) mutatePod(pod *corev1.Pod, secretManagerConfig secret
 		mw.logger.Debugf("No pod init containers were mutated")
 	}
 
-	containersMutated, err := mw.mutateContainers(pod.Spec.Containers, &pod.Spec, secretManagerConfig, ns)
+	containersMutated, err := mw.mutateContainers(pod.Spec.Containers, &pod.Spec, providers, ns)
 	if err != nil {
 		return err
 	}
@@ -326,10 +292,10 @@ func (mw *mutatingWebhook) mutatePod(pod *corev1.Pod, secretManagerConfig secret
 	}
 
 	if initContainersMutated || containersMutated {
-		pod.Spec.InitContainers = append(getInitContainers(pod.Spec.Containers, secretManagerConfig, initContainersMutated, containersMutated), pod.Spec.InitContainers...)
+		pod.Spec.InitContainers = append(getInitContainers(pod.Spec.Containers, initContainersMutated, containersMutated), pod.Spec.InitContainers...)
 		mw.logger.Debugf("Successfully appended pod init containers to spec")
 
-		pod.Spec.Volumes = append(pod.Spec.Volumes, mw.getVolumes(pod.Spec.Volumes, secretManagerConfig)...)
+		pod.Spec.Volumes = append(pod.Spec.Volumes, mw.getVolumes(pod.Spec.Volumes, providers)...)
 		mw.logger.Debugf("Successfully appended pod spec volumes")
 	}
 
@@ -340,144 +306,31 @@ func (mw *mutatingWebhook) mutatePod(pod *corev1.Pod, secretManagerConfig secret
 	return nil
 }
 
-// take all the annotations (m), filter the prefix(delemiter) "secret-config-" and sort them alpha-numeric
-func filterAndSortMapNumStr(m map[string]string, delimiter string) ([]string, error) {
-	keys := make([]string, 0, len(m))
-
-	for k := range m {
-		if strings.HasPrefix(k, delimiter) {
-			keys = append(keys, k)
-		}
-	}
-
-	if len(keys) > 0 {
-		sort.Slice(keys, func(i, j int) bool {
-			numA, _ := strconv.Atoi(strings.Split(keys[i], delimiter)[1])
-			numB, _ := strconv.Atoi(strings.SplitAfter(keys[j], delimiter)[1])
-			return numA < numB
-		})
-	}
-
-	return keys, nil
-}
-
-func (mw *mutatingWebhook) parseSecretManagerConfig(obj metav1.Object) secretManagerConfig {
-	var smCfg secretManagerConfig
-	annotations := obj.GetAnnotations()
-
-	smCfg.gcp.config.enabled, _ = strconv.ParseBool(annotations[AnnotationGCPSecretManagerEnabled])
-	smCfg.gcp.config.projectID = annotations[AnnotationGCPSecretManagerProjectID]
-	smCfg.gcp.config.secretName = annotations[AnnotationGCPSecretManagerSecretName]
-	smCfg.gcp.config.secretVersion = annotations[AnnotationGCPSecretManagerSecretVersion]
-	smCfg.gcp.config.serviceAccountKeySecretName = annotations[AnnotationGCPSecretManagerGCPServiceAccountKeySecretName]
-
-	smCfg.azure.config.enabled, _ = strconv.ParseBool(annotations[AnnotationAzureKeyVaultEnabled])
-	smCfg.azure.config.azureKeyVaultName = annotations[AnnotationAzureKeyVaultName]
-
-	smCfg.aws.config.enabled, _ = strconv.ParseBool(annotations[AnnotationAWSSecretManagerEnabled])
-	smCfg.aws.config.region = annotations[AnnotationAWSSecretManagerRegion]
-	smCfg.aws.config.roleARN = annotations[AnnotationAWSSecretManagerRoleARN]
-	smCfg.aws.config.secretName = annotations[AnnotationAWSSecretManagerSecretName]
-	smCfg.aws.config.previousVersion = annotations[AnnotationAWSSecretManagerPreviousVersion]
-
-	smCfg.vault.config.enabled, _ = strconv.ParseBool(annotations[AnnotationVaultEnabled])
-	smCfg.vault.config.addr = annotations[AnnotationVaultService]
-	smCfg.vault.config.path = annotations[AnnotationVaultSecretPath]
-	smCfg.vault.config.role = annotations[AnnotationVaultRole]
-	smCfg.vault.config.tlsSecretName = annotations[AnnotationVaultTLSSecret]
-	smCfg.vault.config.vaultCACert = annotations[AnnotationVaultCACert]
-	smCfg.vault.config.tokenPath = annotations[AnnotationVaultK8sTokenPath]
-	smCfg.vault.config.backend = annotations[AnnotationVaultAuthPath]
-	smCfg.vault.config.useSecretNamesAsKeys, _ = strconv.ParseBool(annotations[AnnotationVaultUseSecretNamesAsKeys])
-	smCfg.vault.config.version = annotations[AnnotationVaultSecretVersion]
-	smCfg.vault.config.kubernetesBackend = annotations[AnnotationVaultAuthPath]
-	smCfg.vault.config.secretConfigs = []string{}
-	keys, err := filterAndSortMapNumStr(annotations, AnnotationVaultMultiSecretPrefix)
-
-	if err != nil {
-		mw.logger.Warnf("sorting annotations of %s failed! %+v", AnnotationVaultMultiSecretPrefix, err)
-	}
-
-	for _, k := range keys {
-		smCfg.vault.config.secretConfigs = append(smCfg.vault.config.secretConfigs, annotations[k])
-	}
-
-	return smCfg
-}
-
 // SecretsMutator if object is Pod mutate pod specs
 // return a stop boolean to stop executing the chain and also an error.
 func (mw *mutatingWebhook) SecretsMutator(ctx context.Context, obj metav1.Object) (bool, error) {
-	smCfg := mw.parseSecretManagerConfig(obj)
-	mw.logger.Debugf("Secret Managers config: %#v", smCfg)
+	annotations := obj.GetAnnotations()
+	providers := mw.providerRegistry.BuildEnabledProviders(annotations)
+
+	if len(providers) == 0 {
+		return false, nil
+	}
+
+	// Log which providers are active
+	for _, p := range providers {
+		mw.logger.Infof("Using %s secret manager", p.Name())
+	}
+
+	// Validate all enabled providers
+	for _, p := range providers {
+		if err := p.Validate(); err != nil {
+			return true, err
+		}
+	}
 
 	switch v := obj.(type) {
 	case *corev1.Pod:
-		if smCfg.azure.config.enabled {
-			mw.logger.Infof("Using Azure Key Vault")
-
-			if smCfg.azure.config.azureKeyVaultName == "" {
-				return true, fmt.Errorf("Error getting azure key vault - make sure you set the annotation %s on the Pod", AnnotationAzureKeyVaultName)
-			}
-
-			return false, mw.mutatePod(v, smCfg, whcontext.GetAdmissionRequest(ctx).Namespace, whcontext.IsAdmissionRequestDryRun(ctx))
-		}
-
-		if smCfg.aws.config.enabled {
-			mw.logger.Infof("Using AWS Secret Manager")
-
-			if smCfg.aws.config.secretName == "" {
-				return true, fmt.Errorf("Error getting aws secret name - make sure you set the annotation %s on the Pod", AnnotationAWSSecretManagerSecretName)
-			}
-
-			return false, mw.mutatePod(v, smCfg, whcontext.GetAdmissionRequest(ctx).Namespace, whcontext.IsAdmissionRequestDryRun(ctx))
-		}
-
-		if smCfg.gcp.config.enabled {
-			var err error
-			mw.logger.Infof("Using GCP Secret Manager")
-
-			if smCfg.gcp.config.projectID == "" {
-				err = fmt.Errorf("Error getting gcp project id - make sure you set the annotation %s on the Pod", AnnotationGCPSecretManagerProjectID)
-			}
-			if smCfg.gcp.config.secretName == "" {
-				err = fmt.Errorf("Error getting gcp secret name - make sure you set the annotation %s on the Pod", AnnotationGCPSecretManagerSecretName)
-			}
-
-			if err != nil {
-				return true, err
-			}
-
-			return false, mw.mutatePod(v, smCfg, whcontext.GetAdmissionRequest(ctx).Namespace, whcontext.IsAdmissionRequestDryRun(ctx))
-		}
-
-		if smCfg.vault.config.enabled {
-			var err error
-			mw.logger.Info("Using Vault Secret Manager")
-
-			if smCfg.vault.config.addr == "" {
-				err = fmt.Errorf("Error getting vault service address - make sure you set the annotation %s on the Pod", AnnotationVaultEnabled)
-			}
-
-			if smCfg.vault.config.path == "" && len(smCfg.vault.config.secretConfigs) == 0 {
-				err = fmt.Errorf("Error getting vault secret path - make sure you either set the annotation %s or use the annotation %s-x where x is the secret number", AnnotationVaultSecretPath, AnnotationVaultMultiSecretPrefix)
-			}
-
-			if smCfg.vault.config.role == "" {
-				err = fmt.Errorf("Error getting vault role - make sure you set the annotation %s", AnnotationVaultRole)
-			}
-
-			if smCfg.vault.config.tlsSecretName != "" && smCfg.vault.config.vaultCACert == "" {
-				err = fmt.Errorf("Error getting CA cert filename - make sure you set the annotation %s with the CA cert file name", AnnotationVaultCACert)
-			}
-
-			if err != nil {
-				return true, err
-			}
-
-			return false, mw.mutatePod(v, smCfg, whcontext.GetAdmissionRequest(ctx).Namespace, whcontext.IsAdmissionRequestDryRun(ctx))
-		}
-		return false, nil
+		return false, mw.mutatePod(v, providers, whcontext.GetAdmissionRequest(ctx).Namespace, whcontext.IsAdmissionRequestDryRun(ctx))
 	default:
 		return false, nil
 	}
@@ -559,9 +412,10 @@ func main() {
 	}
 
 	mutatingWebhook := mutatingWebhook{
-		k8sClient: k8sClient,
-		registry:  registry.NewRegistry(),
-		logger:    logger,
+		k8sClient:        k8sClient,
+		registry:         registry.NewRegistry(),
+		logger:           logger,
+		providerRegistry: newProviderRegistry(),
 	}
 
 	mutator := mutating.MutatorFunc(mutatingWebhook.SecretsMutator)
