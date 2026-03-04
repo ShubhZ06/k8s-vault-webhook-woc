@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 
 	log "github.com/sirupsen/logrus"
-
-	"net/http"
-	"strings"
 
 	"k8s-vault-webhook/provider"
 	"k8s-vault-webhook/registry"
@@ -32,6 +35,11 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 	kubernetesConfig "sigs.k8s.io/controller-runtime/pkg/client/config"
+)
+
+const (
+	// AnnotationOptOut allows workloads to explicitly opt out of secret injection.
+	AnnotationOptOut = "vault.opstree.secret.manager/opt-out"
 )
 
 func (mw *mutatingWebhook) getVolumes(existingVolumes []corev1.Volume, providers []provider.SecretManager) []corev1.Volume {
@@ -306,10 +314,35 @@ func (mw *mutatingWebhook) mutatePod(pod *corev1.Pod, providers []provider.Secre
 	return nil
 }
 
+// isNamespaceExcluded checks if the given namespace is in the exclusion list.
+func (mw *mutatingWebhook) isNamespaceExcluded(ns string) bool {
+	excluded := viper.GetStringSlice("excluded_namespaces")
+	for _, e := range excluded {
+		if strings.EqualFold(e, ns) {
+			return true
+		}
+	}
+	return false
+}
+
 // SecretsMutator if object is Pod mutate pod specs
 // return a stop boolean to stop executing the chain and also an error.
 func (mw *mutatingWebhook) SecretsMutator(ctx context.Context, obj metav1.Object) (bool, error) {
+	// Safety: skip excluded namespaces (e.g., kube-system)
+	ns := whcontext.GetAdmissionRequest(ctx).Namespace
+	if mw.isNamespaceExcluded(ns) {
+		mw.logger.Debugf("Skipping mutation for excluded namespace: %s", ns)
+		return false, nil
+	}
+
 	annotations := obj.GetAnnotations()
+
+	// Safety: explicit workload opt-out via annotation
+	if strings.EqualFold(annotations[AnnotationOptOut], "true") {
+		mw.logger.Infof("Skipping mutation: workload opted out via annotation %s", AnnotationOptOut)
+		return false, nil
+	}
+
 	providers := mw.providerRegistry.BuildEnabledProviders(annotations)
 
 	if len(providers) == 0 {
@@ -330,7 +363,7 @@ func (mw *mutatingWebhook) SecretsMutator(ctx context.Context, obj metav1.Object
 
 	switch v := obj.(type) {
 	case *corev1.Pod:
-		return false, mw.mutatePod(v, providers, whcontext.GetAdmissionRequest(ctx).Namespace, whcontext.IsAdmissionRequestDryRun(ctx))
+		return false, mw.mutatePod(v, providers, ns, whcontext.IsAdmissionRequestDryRun(ctx))
 	default:
 		return false, nil
 	}
@@ -384,6 +417,8 @@ func init() {
 	viper.SetDefault("debug", "false")
 	viper.SetDefault("enable_json_log", "false")
 	viper.SetDefault("telemetry_listen_address", "")
+	viper.SetDefault("excluded_namespaces", []string{"kube-system", "kube-public", "kube-node-lease"})
+	viper.SetDefault("shutdown_timeout", "15s")
 	viper.AutomaticEnv()
 }
 
@@ -418,6 +453,8 @@ func main() {
 		providerRegistry: newProviderRegistry(),
 	}
 
+	logger.Infof("Excluded namespaces: %v", viper.GetStringSlice("excluded_namespaces"))
+
 	mutator := mutating.MutatorFunc(mutatingWebhook.SecretsMutator)
 
 	metricsRecorder := metrics.NewPrometheus(prometheus.DefaultRegisterer)
@@ -440,15 +477,45 @@ func main() {
 		mux.Handle("/metrics", promhttp.Handler())
 	}
 
-	if tlsCertFile == "" && tlsPrivateKeyFile == "" {
-		logger.Infof("Listening on http://%s", listenAddress)
-		err = http.ListenAndServe(listenAddress, mux)
-	} else {
-		logger.Infof("Listening on https://%s", listenAddress)
-		err = http.ListenAndServeTLS(listenAddress, tlsCertFile, tlsPrivateKeyFile, mux)
+	// Graceful shutdown: use http.Server so we can call Shutdown()
+	server := &http.Server{
+		Addr:    listenAddress,
+		Handler: mux,
 	}
 
-	if err != nil {
-		log.Fatalf("error serving webhook: %s", err)
+	// Channel to listen for OS signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Start the server in a goroutine
+	go func() {
+		if tlsCertFile == "" && tlsPrivateKeyFile == "" {
+			logger.Infof("Listening on http://%s", listenAddress)
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("error serving webhook: %s", err)
+			}
+		} else {
+			logger.Infof("Listening on https://%s", listenAddress)
+			if err := server.ListenAndServeTLS(tlsCertFile, tlsPrivateKeyFile); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("error serving webhook: %s", err)
+			}
+		}
+	}()
+
+	// Block until we receive a signal
+	sig := <-stop
+	logger.Infof("Received signal %v, shutting down gracefully...", sig)
+
+	shutdownTimeout, _ := time.ParseDuration(viper.GetString("shutdown_timeout"))
+	if shutdownTimeout == 0 {
+		shutdownTimeout = 15 * time.Second
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Fatalf("Server forced to shutdown: %s", err)
+	}
+
+	logger.Info("Server exited gracefully")
 }
