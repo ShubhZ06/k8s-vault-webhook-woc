@@ -1,6 +1,7 @@
 package gcp
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 
@@ -110,4 +111,9 @@ func (p *GCPProvider) ExtraVolumes() []corev1.Volume {
 		}
 	}
 	return nil
+}
+
+func (p *GCPProvider) GetCurrentVersion(ctx context.Context, annotations map[string]string) (string, error) {
+	// TODO: Implement actual GCP Secret Manager API hit to fetch version
+	return "1", nil
 }

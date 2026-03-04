@@ -1,6 +1,8 @@
 package provider
 
 import (
+	"context"
+
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -28,4 +30,8 @@ type SecretManager interface {
 	// These are appended to pod.Spec.Volumes by the webhook.
 	// Return nil or empty slice if no extra volumes are needed.
 	ExtraVolumes() []corev1.Volume
+
+	// GetCurrentVersion retrieves the current active version string of the secret
+	// configured by annotations. Used by the rotation controller to detect external changes.
+	GetCurrentVersion(ctx context.Context, annotations map[string]string) (string, error)
 }

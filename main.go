@@ -28,19 +28,32 @@ import (
 	whcontext "github.com/slok/kubewebhook/pkg/webhook/context"
 	"github.com/slok/kubewebhook/pkg/webhook/mutating"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+
+	"k8s-vault-webhook/controllers"
 
 	"k8s.io/client-go/kubernetes"
+	ctrl "sigs.k8s.io/controller-runtime"
 	kubernetesConfig "sigs.k8s.io/controller-runtime/pkg/client/config"
+	crtllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 const (
 	// AnnotationOptOut allows workloads to explicitly opt out of secret injection.
 	AnnotationOptOut = "vault.opstree.secret.manager/opt-out"
+
+	// AnnotationRotationInterval defines how often the rotation controller checks for new secrets.
+	AnnotationRotationInterval = "vault.opstree.secret.manager/rotation-interval"
+
+	// AnnotationInjectedVersion stores the version of the secret that was injected.
+	AnnotationInjectedVersion = "vault.opstree.secret.manager/injected-version"
 )
 
 func (mw *mutatingWebhook) getVolumes(existingVolumes []corev1.Volume, providers []provider.SecretManager) []corev1.Volume {
@@ -408,6 +421,21 @@ func (mw *mutatingWebhook) SecretsMutator(ctx context.Context, obj metav1.Object
 			return true, err
 		}
 
+		// --- NEW: Inject Initial Version for Rotation ---
+		if _, hasRotation := annotations[AnnotationRotationInterval]; hasRotation {
+			if len(providers) > 0 {
+				versionResult, err := providers[0].GetCurrentVersion(ctx, annotations)
+				if err == nil && versionResult != "" {
+					if v.Annotations == nil {
+						v.Annotations = make(map[string]string)
+					}
+					v.Annotations[AnnotationInjectedVersion] = versionResult
+					reqLogger.WithField("injected_version", versionResult).Info("Injected rotation baseline version")
+				}
+			}
+		}
+		// ------------------------------------------------
+
 		reqLogger.Info("Pod mutation completely successfully")
 		for _, p := range providers {
 			metrics.MutationsTotal.WithLabelValues(p.Name(), ns, "success").Inc()
@@ -506,6 +534,42 @@ func main() {
 		providerRegistry: newProviderRegistry(),
 	}
 
+	// ----------------------------------------------------
+	// Configure & Start the Rotation Controller Manager
+	// ----------------------------------------------------
+	managerCtx, managerCancel := context.WithCancel(context.Background())
+	defer managerCancel()
+
+	crtllog.SetLogger(zap.New(zap.UseDevMode(viper.GetBool("debug"))))
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	mgr, mgrErr := ctrl.NewManager(kubernetesConfig.GetConfigOrDie(), ctrl.Options{
+		Scheme: scheme,
+		Logger: crtllog.Log,
+	})
+	if mgrErr != nil {
+		logger.Fatalf("unable to start manager: %v", mgrErr)
+	}
+
+	if mgrErr = (&controllers.SecretRotationReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		ProviderRegistry: mutatingWebhook.providerRegistry,
+	}).SetupWithManager(mgr); mgrErr != nil {
+		logger.Fatalf("unable to create controller: %v", mgrErr)
+	}
+
+	go func() {
+		logger.Info("Starting rotation controller manager")
+		if err := mgr.Start(managerCtx); err != nil {
+			logger.Fatalf("problem running manager: %v", err)
+		}
+	}()
+	// ----------------------------------------------------
+
 	logger.Infof("Excluded namespaces: %v", viper.GetStringSlice("excluded_namespaces"))
 
 	mutator := mutating.MutatorFunc(mutatingWebhook.SecretsMutator)
@@ -558,6 +622,9 @@ func main() {
 	// Block until we receive a signal
 	sig := <-stop
 	logger.Infof("Received signal %v, shutting down gracefully...", sig)
+
+	// Stop rotation controller manager immediately
+	managerCancel()
 
 	shutdownTimeout, _ := time.ParseDuration(viper.GetString("shutdown_timeout"))
 	if shutdownTimeout == 0 {

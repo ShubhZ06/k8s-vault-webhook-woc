@@ -1,6 +1,7 @@
 package azure
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 
@@ -63,4 +64,9 @@ func (p *AzureProvider) MutateContainer(container corev1.Container) corev1.Conta
 
 func (p *AzureProvider) ExtraVolumes() []corev1.Volume {
 	return nil
+}
+
+func (p *AzureProvider) GetCurrentVersion(ctx context.Context, annotations map[string]string) (string, error) {
+	// TODO: Implement actual Azure Key Vault API hit to fetch version
+	return "1", nil
 }

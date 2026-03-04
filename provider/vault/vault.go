@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -170,6 +171,11 @@ func (p *VaultProvider) ExtraVolumes() []corev1.Volume {
 		}
 	}
 	return nil
+}
+
+func (p *VaultProvider) GetCurrentVersion(ctx context.Context, annotations map[string]string) (string, error) {
+	// TODO: Implement actual Vault HTTP API hit to fetch KV metadata version
+	return "1", nil
 }
 
 // filterAndSortSecretConfigs filters annotations by prefix and sorts them numerically.

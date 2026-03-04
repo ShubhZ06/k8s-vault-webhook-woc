@@ -1,6 +1,7 @@
 package aws
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 
@@ -82,4 +83,9 @@ func (p *AWSProvider) MutateContainer(container corev1.Container) corev1.Contain
 
 func (p *AWSProvider) ExtraVolumes() []corev1.Volume {
 	return nil
+}
+
+func (p *AWSProvider) GetCurrentVersion(ctx context.Context, annotations map[string]string) (string, error) {
+	// TODO: Implement actual AWS Secrets Manager API hit to fetch AWSCURRENT version ID
+	return "AWSCURRENT", nil
 }
