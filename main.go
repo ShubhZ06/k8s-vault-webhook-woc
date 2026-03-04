@@ -12,6 +12,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"k8s-vault-webhook/metrics"
 	"k8s-vault-webhook/provider"
 	"k8s-vault-webhook/registry"
 	"k8s-vault-webhook/version"
@@ -23,7 +24,7 @@ import (
 	"github.com/spf13/viper"
 
 	whhttp "github.com/slok/kubewebhook/pkg/http"
-	"github.com/slok/kubewebhook/pkg/observability/metrics"
+	whmetrics "github.com/slok/kubewebhook/pkg/observability/metrics"
 	whcontext "github.com/slok/kubewebhook/pkg/webhook/context"
 	"github.com/slok/kubewebhook/pkg/webhook/mutating"
 
@@ -328,10 +329,27 @@ func (mw *mutatingWebhook) isNamespaceExcluded(ns string) bool {
 // SecretsMutator if object is Pod mutate pod specs
 // return a stop boolean to stop executing the chain and also an error.
 func (mw *mutatingWebhook) SecretsMutator(ctx context.Context, obj metav1.Object) (bool, error) {
-	// Safety: skip excluded namespaces (e.g., kube-system)
+	startTime := time.Now()
 	ns := whcontext.GetAdmissionRequest(ctx).Namespace
+	req := whcontext.GetAdmissionRequest(ctx)
+
+	// Create a base logger with structured fields for this admission request
+	reqLogger := mw.logger.WithFields(logrus.Fields{
+		"namespace": ns,
+		"uid":       req.UID,
+		"operation": string(req.Operation),
+	})
+
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		metrics.AdmissionDuration.WithLabelValues(ns).Observe(duration)
+		reqLogger.WithField("duration_sec", duration).Debug("Admission logic complete")
+	}()
+
+	// Safety: skip excluded namespaces (e.g., kube-system)
 	if mw.isNamespaceExcluded(ns) {
-		mw.logger.Debugf("Skipping mutation for excluded namespace: %s", ns)
+		reqLogger.Info("Skipping mutation: namespace is excluded")
+		metrics.ExcludedPodsTotal.WithLabelValues(ns, "namespace_exclusion").Inc()
 		return false, nil
 	}
 
@@ -339,7 +357,8 @@ func (mw *mutatingWebhook) SecretsMutator(ctx context.Context, obj metav1.Object
 
 	// Safety: explicit workload opt-out via annotation
 	if strings.EqualFold(annotations[AnnotationOptOut], "true") {
-		mw.logger.Infof("Skipping mutation: workload opted out via annotation %s", AnnotationOptOut)
+		reqLogger.Info("Skipping mutation: workload opted out via annotation")
+		metrics.ExcludedPodsTotal.WithLabelValues(ns, "annotation_opt_out").Inc()
 		return false, nil
 	}
 
@@ -349,21 +368,51 @@ func (mw *mutatingWebhook) SecretsMutator(ctx context.Context, obj metav1.Object
 		return false, nil
 	}
 
-	// Log which providers are active
+	// Build a provider list string for logging
+	var providerNames []string
 	for _, p := range providers {
-		mw.logger.Infof("Using %s secret manager", p.Name())
+		providerNames = append(providerNames, p.Name())
 	}
+
+	reqLogger = reqLogger.WithField("providers", strings.Join(providerNames, ","))
+	reqLogger.Info("Validating secret manager configurations")
 
 	// Validate all enabled providers
 	for _, p := range providers {
 		if err := p.Validate(); err != nil {
+			reqLogger.WithFields(logrus.Fields{
+				"failed_provider": p.Name(),
+				"error":           err.Error(),
+			}).Error("Provider validation failed")
+			metrics.MutationsTotal.WithLabelValues(p.Name(), ns, "failed").Inc()
 			return true, err
 		}
 	}
 
 	switch v := obj.(type) {
 	case *corev1.Pod:
-		return false, mw.mutatePod(v, providers, ns, whcontext.IsAdmissionRequestDryRun(ctx))
+		podName := v.Name
+		if podName == "" {
+			podName = v.GenerateName
+		}
+
+		reqLogger = reqLogger.WithField("pod", podName)
+		reqLogger.Info("Executing pod mutation")
+
+		err := mw.mutatePod(v, providers, ns, whcontext.IsAdmissionRequestDryRun(ctx))
+		if err != nil {
+			reqLogger.WithError(err).Error("Pod mutation failed")
+			for _, p := range providers {
+				metrics.MutationsTotal.WithLabelValues(p.Name(), ns, "failed").Inc()
+			}
+			return true, err
+		}
+
+		reqLogger.Info("Pod mutation completely successfully")
+		for _, p := range providers {
+			metrics.MutationsTotal.WithLabelValues(p.Name(), ns, "success").Inc()
+		}
+		return false, nil
 	default:
 		return false, nil
 	}
@@ -384,7 +433,7 @@ func (mw *mutatingWebhook) serveMetrics(addr string) {
 	}
 }
 
-func handlerFor(config mutating.WebhookConfig, mutator mutating.Mutator, recorder metrics.Recorder, logger logrus.FieldLogger) http.Handler {
+func handlerFor(config mutating.WebhookConfig, mutator mutating.Mutator, recorder whmetrics.Recorder, logger logrus.FieldLogger) http.Handler {
 	webhook, err := mutating.NewWebhook(config, mutator, nil, recorder, logger)
 	if err != nil {
 		logger.Fatalf("error creating webhook: %s", err)
@@ -441,6 +490,10 @@ func main() {
 	fmt.Printf("K8s Vault Webhook Version: %s\n", version.GetVersion())
 	fmt.Printf("K8s Secret Injector Version: %s\n", viper.GetString("k8s_secret_injector_image"))
 
+	// Initialize Custom Prometheus Metrics
+	metrics.InitMetrics()
+	logger.Info("Custom Prometheus metrics initialized")
+
 	k8sClient, err := newK8SClient()
 	if err != nil {
 		logger.Fatalf("error creating k8s client: %s", err)
@@ -457,7 +510,7 @@ func main() {
 
 	mutator := mutating.MutatorFunc(mutatingWebhook.SecretsMutator)
 
-	metricsRecorder := metrics.NewPrometheus(prometheus.DefaultRegisterer)
+	metricsRecorder := whmetrics.NewPrometheus(prometheus.DefaultRegisterer)
 
 	podHandler := handlerFor(mutating.WebhookConfig{Name: "k8s-secret-injector-pods", Obj: &corev1.Pod{}}, mutator, metricsRecorder, logger)
 

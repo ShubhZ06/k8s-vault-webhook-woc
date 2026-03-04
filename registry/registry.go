@@ -22,6 +22,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"k8s-vault-webhook/metrics"
 )
 
 const ecrCredentialsKey = "AWS_ECR_CREDENTIALS"
@@ -86,21 +88,50 @@ func (r *Registry) GetImageConfig(
 	allowToCache := IsAllowedToCache(container)
 	if allowToCache {
 		if imageConfig, cacheHit := r.imageCache.Get(container.Image); cacheHit {
-			logger.Infof("found image %s in cache", container.Image)
+			logger.WithFields(log.Fields{
+				"image":  container.Image,
+				"action": "registry_cache_hit",
+			}).Debugf("found image in cache")
+			metrics.RegistryCacheHits.Inc()
+			metrics.RegistryLookupsTotal.WithLabelValues("cache", "success").Inc()
 			return imageConfig.(*imagev1.ImageConfig), nil
 		}
+	}
+
+	if allowToCache {
+		metrics.RegistryCacheMisses.Inc()
 	}
 
 	containerInfo := ContainerInfo{Namespace: namespace, clientset: clientset}
 
 	err := containerInfo.Collect(container, podSpec, r.credentialsCache)
 	if err != nil {
+		logger.WithFields(log.Fields{
+			"image": container.Image,
+			"error": err.Error(),
+		}).Errorf("Failed to collect container info")
+		metrics.RegistryLookupsTotal.WithLabelValues("unknown", "failed").Inc()
 		return nil, err
 	}
 
-	logger.Infoln("I'm using registry", containerInfo.RegistryAddress)
+	logger.WithFields(log.Fields{
+		"registry": containerInfo.RegistryAddress,
+		"image":    container.Image,
+	}).Debugf("Fetching image config from external registry")
 
 	imageConfig, err := getImageBlob(containerInfo)
+	if err != nil {
+		logger.WithFields(log.Fields{
+			"registry": containerInfo.RegistryAddress,
+			"image":    container.Image,
+			"error":    err.Error(),
+		}).Errorf("Failed to retrieve image config")
+		metrics.RegistryLookupsTotal.WithLabelValues(containerInfo.RegistryAddress, "failed").Inc()
+		return imageConfig, err
+	}
+
+	metrics.RegistryLookupsTotal.WithLabelValues(containerInfo.RegistryAddress, "success").Inc()
+
 	if imageConfig != nil && allowToCache {
 		r.imageCache.Set(container.Image, imageConfig, cache.DefaultExpiration)
 	}
