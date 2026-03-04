@@ -86,7 +86,7 @@ func (p *GCPProvider) MutateContainer(container corev1.Container) corev1.Contain
 	if p.config.SecretVersion != "" {
 		args = append(args, fmt.Sprintf("--secret-version=%s", p.config.SecretVersion))
 	}
-	if p.config.SecretName != "" {
+	if p.config.ServiceAccountKeySecretName != "" {
 		args = append(args, fmt.Sprintf("--google-application-credentials=%s", fmt.Sprintf("%s/%s", VolumeMountGoogleCloudKeyPath, GCPServiceAccountCredentialsFileName)))
 	}
 

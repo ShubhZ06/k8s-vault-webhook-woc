@@ -70,7 +70,7 @@ func (p *AWSProvider) MutateContainer(container corev1.Container) corev1.Contain
 	if p.config.RoleARN != "" {
 		args = append(args, fmt.Sprintf("--role-arn=%s", p.config.RoleARN))
 	}
-	if p.config.SecretName != "" {
+	if p.config.PreviousVersion != "" {
 		args = append(args, fmt.Sprintf("--previous-version=%s", p.config.PreviousVersion))
 	}
 

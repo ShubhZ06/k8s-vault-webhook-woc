@@ -53,6 +53,10 @@ This project is based on secret-consumer-webhook. Please check out the source co
 - Secret injection in pods/containers from GCP Secret Manager
 - Support regex to inject all secrets from a certain path of Vault
 - Inject secrets directly to the process of container, i.e. after the injection you cannot read secrets from the environment variable
+- **[NEW] Global Namespace Exclusion**: Configure `-excluded_namespaces` to skip webhook mutation in critical namespaces like `kube-system`.
+- **[NEW] Workload Opt-Out**: Set annotation `vault.opstree.secret.manager/opt-out: "true"` to ignore explicit pods.
+- **[NEW] Prometheus Metrics**: Telemetry natively exposed globally on `/metrics` to track admission requests and mutations.
+- **[NEW] Secret Rotation Controller**: Reconciler dynamically detects underlying secret version alterations dynamically safely triggers a rolling restart (`vault.opstree.secret.manager/rotation-interval: "1h"`).
 
 ### Architecture
 
